@@ -73,6 +73,8 @@ static pthread_barrier_t start_barrier;
 static FILE *log_file = NULL;
 
 // --- Утилиты ---
+// Обработчик SIGINT ставит атомарный флаг остановки.
+// Только асинхронно-безопасные функции: выводим короткое сообщение и ставим флаг.
 static void handle_sigint(int sig) {
     (void)sig;
     atomic_store(&stop_requested, true);
@@ -141,12 +143,14 @@ static void queue_push(PatientQueue *queue, Patient *patient) {
     queue->items[queue->tail] = patient;
     queue->tail = (queue->tail + 1) % queue->capacity;
     queue->size++;
+    // Сигналим ровно одному ожидающему врачу: очереди используют «один заходит — один выходит».
     pthread_cond_signal(&queue->cond);
     pthread_mutex_unlock(&queue->mutex);
 }
 
 static Patient *queue_pop_wait(PatientQueue *queue) {
     pthread_mutex_lock(&queue->mutex);
+    // Ожидаем пациента, но периодически выходим по флагу остановки.
     while (queue->size == 0 && !atomic_load(&stop_requested)) {
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
@@ -159,6 +163,7 @@ static Patient *queue_pop_wait(PatientQueue *queue) {
     }
 
     if (queue->size == 0 && atomic_load(&stop_requested)) {
+        // Очередь пуста и смена остановлена: выходим, чтобы завершить поток врача.
         pthread_mutex_unlock(&queue->mutex);
         return NULL;
     }
@@ -190,12 +195,21 @@ static void patient_mark_done(Patient *patient) {
     pthread_mutex_unlock(&patient->mutex);
 }
 
-static void patient_wait_done(Patient *patient) {
+// Ожидаем завершение приёма пациента. При остановке смены сами помечаем пациента
+// завершённым, чтобы поток пациента не завис навсегда, даже если его никто не успел принять.
+static bool patient_wait_done(Patient *patient) {
     pthread_mutex_lock(&patient->mutex);
-    while (!patient->done) {
+    while (!patient->done && !atomic_load(&stop_requested)) {
         pthread_cond_wait(&patient->cond, &patient->mutex);
     }
+
+    bool completed = patient->done;
+    if (!completed && atomic_load(&stop_requested)) {
+        // Никто не принял пациента до завершения смены — выпускаем его сами.
+        patient->done = true;
+    }
     pthread_mutex_unlock(&patient->mutex);
+    return completed;
 }
 
 // --- Параметры симуляции ---
@@ -421,6 +435,7 @@ static void *patient_routine(void *arg) {
     Patient *patient = malloc(sizeof(Patient));
     patient_init(patient, args->id);
 
+    // Появление пациента во времени моделируется задержкой до прихода в регистратуру.
     int arrival_delay = random_between(config.arrival_min_ms, config.arrival_max_ms);
     sleep_ms(arrival_delay);
     if (atomic_load(&stop_requested)) {
@@ -434,8 +449,12 @@ static void *patient_routine(void *arg) {
     log_event("Пациент %d пришёл в регистратуру через %d мс", patient->id, arrival_delay);
     queue_push(&triage_queue, patient);
 
-    patient_wait_done(patient);
-    log_event("Пациент %d завершил лечение и уходит домой", patient->id);
+    bool treated = patient_wait_done(patient);
+    if (treated) {
+        log_event("Пациент %d завершил лечение и уходит домой", patient->id);
+    } else {
+        log_event("Пациент %d покидает клинику из-за завершения смены", patient->id);
+    }
 
     patient_destroy(patient);
     free(patient);
@@ -616,10 +635,12 @@ int main(int argc, char *argv[]) {
         pthread_create(&patients[i], NULL, patient_routine, args);
     }
 
+    // Дожидаемся, пока все пациенты покинут клинику (после лечения или из-за остановки смены).
     for (int i = 0; i < config.patient_count; ++i) {
         pthread_join(patients[i], NULL);
     }
 
+    // Отправляем сигналы окончания для дежурных врачей, чтобы снять их с ожидания очереди.
     for (int i = 0; i < 2; ++i) {
         queue_push(&triage_queue, NULL);
     }
@@ -628,6 +649,7 @@ int main(int argc, char *argv[]) {
         pthread_join(duty_doctors[i], NULL);
     }
 
+    // Завершаем специалистов: каждому достаётся пустой элемент, чтобы корректно выйти из цикла.
     queue_push(&dentist_queue, NULL);
     queue_push(&surgeon_queue, NULL);
     queue_push(&therapist_queue, NULL);

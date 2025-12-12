@@ -1,3 +1,5 @@
+#define _POSIX_C_SOURCE 200809L
+
 #include <pthread.h>
 #include <semaphore.h>
 #include <stdbool.h>
@@ -6,6 +8,7 @@
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 #include <limits.h>
 #include <time.h>
 #include <unistd.h>
@@ -67,6 +70,8 @@ static pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
 static volatile sig_atomic_t stop_requested = 0;
 static FILE *log_file = NULL;
 
+// Обработчик SIGINT: ставит атомарный флаг и выводит минимальное сообщение
+// асинхронно-безопасными средствами. Потоки далее сами проверяют stop_requested.
 static void handle_sigint(int sig) {
     (void)sig;
     stop_requested = 1;
@@ -93,6 +98,58 @@ static void sleep_ms(int ms) {
     ts.tv_sec = ms / 1000;
     ts.tv_nsec = (long)(ms % 1000) * 1000000L;
     nanosleep(&ts, NULL);
+}
+
+// Ожидание семафора с периодической проверкой stop_requested.
+// Используется дежурными и специалистами, чтобы они не зависали при завершении смены.
+static int sem_wait_interruptible(sem_t *sem) {
+    if (!stop_requested) {
+        return sem_wait(sem);
+    }
+
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_nsec += 100 * 1000000L; // 100 ms
+    if (ts.tv_nsec >= 1000000000L) {
+        ts.tv_sec += 1;
+        ts.tv_nsec -= 1000000000L;
+    }
+
+    int rc = sem_timedwait(sem, &ts);
+    if (rc == -1 && errno == ETIMEDOUT) {
+        return -1;
+    }
+    return rc;
+}
+
+// Ожидаем завершение пациента и позволяём ему уйти, если смена остановлена и семафор
+// не был поднят ни дежурным, ни специалистом.
+static bool sem_wait_patient_finish(sem_t *sem) {
+    while (true) {
+        if (!stop_requested) {
+            if (sem_wait(sem) == 0) {
+                return true;
+            }
+            if (errno == EINTR) {
+                continue;
+            }
+        }
+
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += 100 * 1000000L;
+        if (ts.tv_nsec >= 1000000000L) {
+            ts.tv_sec += 1;
+            ts.tv_nsec -= 1000000000L;
+        }
+
+        if (sem_timedwait(sem, &ts) == 0) {
+            return true;
+        }
+        if (errno == ETIMEDOUT && stop_requested) {
+            return false;
+        }
+    }
 }
 
 static void queue_init(PatientQueue *queue, size_t capacity) {
@@ -166,6 +223,7 @@ static void *patient_routine(void *arg) {
     patient->id = args->id;
     sem_init(&patient->finished, 0, 0);
 
+    // Имитация времени прихода пациента до появления в регистратуре.
     int arrival_delay = random_between(config.arrival_min_ms, config.arrival_max_ms);
     sleep_ms(arrival_delay);
     if (stop_requested) {
@@ -181,8 +239,12 @@ static void *patient_routine(void *arg) {
     queue_push(&triage_queue, patient);
     sem_post(&triage_waiting);
 
-    sem_wait(&patient->finished);
-    log_event("Пациент %d завершил лечение и уходит домой", patient->id);
+    bool treated = sem_wait_patient_finish(&patient->finished);
+    if (treated) {
+        log_event("Пациент %d завершил лечение и уходит домой", patient->id);
+    } else {
+        log_event("Пациент %d покидает клинику из-за завершения смены", patient->id);
+    }
 
     sem_destroy(&patient->finished);
     free(patient);
@@ -205,10 +267,18 @@ static SpecialistType choose_specialist(void) {
 static void *duty_doctor_routine(void *arg) {
     DutyDoctorArgs *args = (DutyDoctorArgs *)arg;
     while (true) {
-        sem_wait(&triage_waiting);
+        if (sem_wait_interruptible(&triage_waiting) == -1 && stop_requested) {
+            break;
+        }
         Patient *patient = queue_pop(&triage_queue);
         if (patient == NULL) {
             break;
+        }
+
+        if (stop_requested) {
+            log_event("Дежурный врач %d сообщает пациенту %d о завершении смены", args->id, patient->id);
+            sem_post(&patient->finished);
+            continue;
         }
 
         int talk_time = random_between(config.triage_min_ms, config.triage_max_ms);
@@ -270,10 +340,18 @@ static void *specialist_routine(void *arg) {
     }
 
     while (true) {
-        sem_wait(waiting);
+        if (sem_wait_interruptible(waiting) == -1 && stop_requested) {
+            break;
+        }
         Patient *patient = queue_pop(queue);
         if (patient == NULL) {
             break;
+        }
+
+        if (stop_requested) {
+            log_event("%s сообщает пациенту %d о завершении смены", specialist_name(type), patient->id);
+            sem_post(&patient->finished);
+            continue;
         }
 
         int treat_time = random_between(config.treatment_min_ms, config.treatment_max_ms);
